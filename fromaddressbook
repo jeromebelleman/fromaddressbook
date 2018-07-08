@@ -1,0 +1,267 @@
+#! /usr/bin/env python
+# coding=utf-8
+
+'''Convert Apple AddressBook into various address book formats'''
+
+import os
+import sys
+reload(sys)
+sys.setdefaultencoding('UTF8')
+import argparse
+import re
+import errno
+import uuid
+import xml.sax.saxutils
+import sqlite3
+import yaml
+
+LABELRE = re.compile(r'[_$!<>]')
+
+
+def esctrip(string):
+    '''
+    Escape and strip string
+    '''
+
+    return xml.sax.saxutils.escape(string.strip())
+
+
+def writecontact(outdir, # pylint: disable=too-many-arguments,too-many-locals
+                 first, middle, last,
+                 street, code, city, country, state, addresslabel,
+                 mail, maillabel,
+                 phone, phonelabel,
+                 organisation,
+                 comments,
+                 group):
+    '''
+    Write contact
+    '''
+
+    contact = {}
+
+    # Set output path
+    name = ' '.join(([last] if last else []) +
+                    ([middle] if middle else []) +
+                    ([first] if first else []))
+
+    if '/' in name:
+        name = name.replace('/', '-')
+        print >> sys.stderr, "Replaced / with - in %s" % name
+
+    path = '%s/%s/%s' % (outdir, group, name)
+    name = [name] if name else []
+    unique = [str(uuid.uuid4())] if os.path.lexists(path) else []
+    path = '%s/%s/%s' % (outdir, group, '-'.join(name + unique))
+
+    # Set address
+    street = [street] if street else []
+    code = [code] if code else []
+    city = [city] if city else []
+    country = [country] if country else []
+    addresslabel = LABELRE.sub('', addresslabel) if addresslabel else ''
+    contact['address'] = ('\n'.join(street + [' '.join(code + city)] + country),
+                          addresslabel)
+
+    # Add phones and mails
+    if phone:
+        phonelabel = LABELRE.sub('', phonelabel)
+        if 'phones' in contact:
+            contact['phones'].append((phone, phonelabel))
+        else:
+            contact['phones'] = [(phone, phonelabel)]
+
+    if mail:
+        maillabel = LABELRE.sub('', maillabel)
+        if 'mails' in contact:
+            contact['mails'].append((mail, maillabel))
+        else:
+            contact['mails'] = [(mail, maillabel)]
+
+    # Set comments
+    if comments:
+        contact['comments'] = comments
+
+    # Set fields that shouldn't be, like state and organisation
+    if state:
+        contact['state'] = state
+    if organisation:
+        contact['organisation'] = organisation
+
+    # Write contact
+    with open(path, 'w') as fhl:
+        yaml.dump(contact, fhl,
+                  allow_unicode=True, default_flow_style=False,
+                  Dumper=yaml.SafeDumper)
+
+
+def dlumecontact(fhl, contacts, contact):
+    '''
+    Write Dlume contact
+    '''
+
+    print >> fhl, '<record>'
+
+    values = contacts[contact]
+
+    # Names
+    first, middle, last = contact.split('!')
+    first = ' '.join(([first] if first else []) + ([middle] if middle else []))
+    if first:
+        print >> fhl, "    <first_name>%s</first_name>" % first
+    if last:
+        print >> fhl, "    <last_name>%s</last_name>" % last
+
+    # Address
+    if 'address' in values:
+        print >> fhl, "    <address>%s</address>" % values['address']
+    if 'postcode' in values:
+        print >> fhl, "    <post_code>%s</post_code>" % values['postcode']
+    if 'city' in values:
+        print >> fhl, "    <city>%s</city>" % values['city']
+    if 'state' in values:
+        print >> fhl, "    <state>%s</state>" % values['state']
+    if 'country' in values:
+        print >> fhl, "    <country>%s</country>" % values['country']
+
+    # Phones
+    for phone in 'home', 'work', 'cell':
+        for i, number in enumerate(values[phone + 'phone'], 1):
+            print >> fhl, "    <%s_phone_%d>%s</%s_phone_%d>" % \
+                (phone, i, number, phone, i)
+
+    # e-Mails
+    for i, email in enumerate(values['email'], 1):
+        print >> fhl, "    <email_%d>%s</email_%d>" % (i, email.strip(), i)
+
+    # Notes
+    if values['notes']:
+        print >> fhl, "    <notes>%s</notes>" % '\n'.join(values['notes'])
+
+    print >> fhl, '</record>'
+
+
+def main(): # pylint: disable=too-many-statements,too-many-branches,too-many-locals
+    '''
+    Main loop
+    '''
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('directory', help="Address Book directory")
+    parser.add_argument('output', help="output file or directory")
+    args = parser.parse_args()
+
+    conn = sqlite3.connect('%s/AddressBook-v22.abcddb' % args.directory)
+    curs = conn.cursor()
+
+    sql = '''
+        SELECT
+            zabcdrecord.z_pk,
+            zfirstname, zmiddlename, zlastname,
+            zstreet, zzipcode, zcity, zcountryname, zstate,
+                zabcdpostaladdress.zlabel,
+            zaddress, zabcdemailaddress.zlabel,
+            zfullnumber, zabcdphonenumber.zlabel,
+            zorganization,
+            ztext,
+            z_15parentgroups1
+        FROM zabcdrecord
+        LEFT JOIN zabcdemailaddress
+        ON zabcdrecord.z_pk = zabcdemailaddress.zowner
+        LEFT JOIN zabcdnote
+        ON zabcdrecord.z_pk = zabcdnote.zcontact
+        LEFT JOIN zabcdpostaladdress
+        ON zabcdrecord.z_pk = zabcdpostaladdress.zowner
+        LEFT JOIN zabcdphonenumber
+        ON zabcdrecord.z_pk = zabcdphonenumber.zowner
+        LEFT JOIN z_19parentgroups
+        ON zabcdrecord.z_pk = z_19parentgroups.z_19contacts
+    '''
+
+    curs.execute(sql)
+
+    if args.output.endswith('dlume-data.xml'):
+        contacts = {}
+
+    for (key,
+         first, middle, last,
+         street, code, city, country, state, addresslabel,
+         mail, maillabel,
+         phone, phonelabel,
+         organisation,
+         comments,
+         group) in curs:
+
+        if os.path.isdir(args.output):
+            try:
+                os.mkdir('%s/%s' % (args.output, group))
+            except OSError, exc:
+                if exc.errno != errno.EEXIST:
+                    raise
+
+            writecontact(args.output,
+                         first, middle, last,
+                         street, code, city, country, state, addresslabel,
+                         mail, maillabel,
+                         phone, phonelabel,
+                         organisation,
+                         comments,
+                         group)
+        elif args.output.endswith('dlume-data.xml'):
+            first = esctrip(first) if first and first.strip() else ''
+            middle = esctrip(middle) if middle and middle.strip() else ''
+            last = esctrip(last) if last and last.strip() else ''
+            key = '!'.join((first, middle, last))
+            if key not in contacts:
+                contacts[key] = {}
+
+            if street and street.strip():
+                contacts[key]['address'] = esctrip(street)
+            if code and code.strip():
+                contacts[key]['postcode'] = esctrip(code)
+            if city and city.strip():
+                contacts[key]['city'] = esctrip(city)
+            if state and state.strip():
+                contacts[key]['state'] = esctrip(state)
+            if country and country.strip():
+                contacts[key]['country'] = esctrip(country)
+
+            if 'workphone' not in contacts[key]:
+                contacts[key]['workphone'] = set()
+            if 'cellphone' not in contacts[key]:
+                contacts[key]['cellphone'] = set()
+            if 'homephone' not in contacts[key]:
+                contacts[key]['homephone'] = set()
+
+            if phone and phone.strip():
+                if phonelabel and 'work' in phonelabel.lower():
+                    contacts[key]['workphone'].add(esctrip(phone))
+                elif phonelabel and 'mobile' in phonelabel.lower():
+                    contacts[key]['cellphone'].add(esctrip(phone))
+                else:
+                    contacts[key]['homephone'].add(esctrip(phone))
+
+            if 'email' not in contacts[key]:
+                contacts[key]['email'] = set()
+            if mail and mail.strip():
+                contacts[key]['email'].add(esctrip(mail))
+
+            if 'notes' not in contacts[key]:
+                contacts[key]['notes'] = set()
+            if organisation and organisation.strip():
+                contacts[key]['notes'].add(esctrip(organisation))
+            if comments and comments.strip():
+                contacts[key]['notes'].add(esctrip(comments))
+
+    if args.output.endswith('dlume-data.xml'):
+        with open(args.output, 'w') as fhl:
+            print >> fhl, '<?xml version="1.0" encoding="utf-8"?>'
+            print >> fhl, '<data records="1">'
+            for contact in contacts:
+                dlumecontact(fhl, contacts, contact)
+            print >> fhl, '</data>'
+
+
+if __name__ == '__main__':
+    sys.exit(main())
